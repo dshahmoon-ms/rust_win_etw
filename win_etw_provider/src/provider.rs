@@ -2,15 +2,21 @@ use crate::guid::GUID;
 use crate::Level;
 use crate::{Error, EventDataDescriptor};
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 use core::pin::Pin;
 use core::ptr::null;
 use core::sync::atomic::{AtomicU8, Ordering::SeqCst};
+extern crate std;
+use std::sync::{LazyLock, Mutex};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Diagnostics::Etw::{EventProviderSetTraits, REGHANDLE};
 
 #[cfg(target_os = "windows")]
 use win_support::*;
+
+#[cfg(target_os = "windows")]
+static PROVIDER_HANDLES: LazyLock<Mutex<Vec<REGHANDLE>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Generates a new activity ID.
 ///
@@ -345,6 +351,10 @@ impl EtwProvider {
                 if error != 0 {
                     Err(Error::WindowsError(error))
                 } else {
+                    // Add handle to global registry
+                    if let Ok(mut handles) = PROVIDER_HANDLES.lock() {
+                        handles.push(handle);
+                    }
                     Ok(EtwProvider { handle, stable })
                 }
             }
@@ -415,14 +425,43 @@ impl EtwProvider {
             Ok(())
         }
     }
+    
+    /// Shutdown all ETW providers by unregistering all handles from the global registry.
+    ///
+    /// This function iterates through all registered provider handles and unregisters them.
+    /// It is useful for cleanup when shutting down an application.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if all providers were successfully unregistered.
+    /// Returns `Err` with the first error encountered if any unregistration fails.
+    #[cfg(target_os = "windows")]
+    pub fn shutdown_all() -> Result<(), Error> {
+        if let Ok(mut handles) = PROVIDER_HANDLES.lock() {
+            for handle in handles.drain(..) {
+                if handle != 0 {
+                    unsafe {
+                        let result = EventUnregister(handle);
+                        if result != 0 {
+                            return Err(Error::WindowsError(result));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for EtwProvider {
     fn drop(&mut self) {
         #[cfg(target_os = "windows")]
         {
-            unsafe {
-                EventUnregister(self.handle);
+            // Only unregister if not already shutdown
+            if self.handle != 0 {
+                unsafe {
+                    EventUnregister(self.handle);
+                }
             }
         }
     }
