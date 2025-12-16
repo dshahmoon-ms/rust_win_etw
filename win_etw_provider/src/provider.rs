@@ -7,8 +7,7 @@ use core::convert::TryFrom;
 use core::pin::Pin;
 use core::ptr::null;
 use core::sync::atomic::{AtomicU8, Ordering::SeqCst};
-extern crate std;
-use std::sync::{LazyLock, Mutex};
+use spin::{Mutex, Once};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Diagnostics::Etw::{EventProviderSetTraits, REGHANDLE};
 
@@ -16,7 +15,12 @@ use windows_sys::Win32::System::Diagnostics::Etw::{EventProviderSetTraits, REGHA
 use win_support::*;
 
 #[cfg(target_os = "windows")]
-static PROVIDER_HANDLES: LazyLock<Mutex<Vec<REGHANDLE>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static PROVIDER_HANDLES: Once<Mutex<Vec<REGHANDLE>>> = Once::new();
+
+#[cfg(target_os = "windows")]
+fn get_provider_handles() -> &'static Mutex<Vec<REGHANDLE>> {
+    PROVIDER_HANDLES.call_once(|| Mutex::new(Vec::new()))
+}
 
 /// Generates a new activity ID.
 ///
@@ -352,7 +356,8 @@ impl EtwProvider {
                     Err(Error::WindowsError(error))
                 } else {
                     // Add handle to global registry
-                    if let Ok(mut handles) = PROVIDER_HANDLES.lock() {
+                    {
+                        let mut handles = get_provider_handles().lock();
                         handles.push(handle);
                     }
                     Ok(EtwProvider { handle, stable })
@@ -437,7 +442,8 @@ impl EtwProvider {
     /// Returns `Err` with the first error encountered if any unregistration fails.
     #[cfg(target_os = "windows")]
     pub fn shutdown_all() -> Result<(), Error> {
-        if let Ok(mut handles) = PROVIDER_HANDLES.lock() {
+        {
+            let mut handles = get_provider_handles().lock();
             for handle in handles.drain(..) {
                 if handle != 0 {
                     unsafe {
