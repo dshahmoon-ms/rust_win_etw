@@ -346,6 +346,10 @@ impl EtwProvider {
                 });
                 let mut handle: REGHANDLE = 0;
                 let stable_ptr: &mut StableProviderData = &mut stable;
+                #[cfg(feature = "dev")]
+                {
+                    println!("Going to register ETW provider with handle: {handle}, ProviderID: {provider_id:?}");
+                }
                 let error = EventRegister(
                     provider_id as *const _ as *const windows_sys::core::GUID,
                     Some(enable_callback),
@@ -353,10 +357,18 @@ impl EtwProvider {
                     &mut handle,
                 );
                 if error != 0 {
+                    #[cfg(feature = "dev")]
+                    {
+                        println!("Failed registering ETW provider with handle: {handle}, ProviderID: {provider_id:?} with error: {error}");
+                    }
                     Err(Error::WindowsError(error))
                 } else {
                     // Add handle to global registry
                     {
+                        #[cfg(feature = "dev")]
+                        {
+                            println!("Registering ETW provider with handle: {handle}, ProviderID: {provider_id:?}");
+                        }
                         let mut handles = get_provider_handles().lock();
                         handles.push(handle);
                     }
@@ -430,7 +442,7 @@ impl EtwProvider {
             Ok(())
         }
     }
-    
+
     /// Shutdown all ETW providers by unregistering all handles from the global registry.
     ///
     /// This function iterates through all registered provider handles and unregisters them.
@@ -441,21 +453,39 @@ impl EtwProvider {
     /// Returns `Ok(())` if all providers were successfully unregistered.
     /// Returns `Err` with the first error encountered if any unregistration fails.
     #[cfg(target_os = "windows")]
-    pub fn shutdown_all() -> Result<(), Error> {
+    pub fn shutdown_all() -> Result<(), Vec<Error>> {
+        #[cfg(feature = "dev")]
         {
-            let mut handles = get_provider_handles().lock();
-            for handle in handles.drain(..) {
-                if handle != 0 {
-                    unsafe {
-                        let result = EventUnregister(handle);
-                        if result != 0 {
-                            return Err(Error::WindowsError(result));
+            println!("Shutting down all ETW providers");
+        }
+        let mut handles = get_provider_handles().lock();
+        let mut err = Vec::new();
+        for handle in handles.drain(..) {
+            if handle != 0 {
+                #[cfg(feature = "dev")]
+                {
+                    println!("Unregistering event provider handle: {handle}");
+                }
+                unsafe {
+                    let result = EventUnregister(handle);
+                    if result != 0 {
+                        err.push(Error::WindowsError(result));
+                        #[cfg(feature = "dev")]
+                        {
+                            println!(
+                                "Failed to unregister ETW provider with handle: {handle}. Error code: {result}"
+                            );
                         }
                     }
                 }
+                #[cfg(feature = "dev")]
+                {
+                    println!("Finished shutting down ETW provider with handle: {handle}");
+                }
             }
         }
-        Ok(())
+
+        err.is_empty().then_some(()).ok_or(err)
     }
 }
 
@@ -463,6 +493,10 @@ impl Drop for EtwProvider {
     fn drop(&mut self) {
         #[cfg(target_os = "windows")]
         {
+            #[cfg(feature = "dev")]
+            {
+                println!("Dropping EtwProvider with handle: {}", self.handle);
+            }
             // Only unregister if not already shutdown
             if self.handle != 0 {
                 unsafe {
