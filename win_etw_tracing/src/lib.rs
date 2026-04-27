@@ -7,6 +7,7 @@
 use bytes::BufMut;
 use core::fmt;
 use std::io::Write;
+use std::sync::Arc;
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span::Attributes;
@@ -28,13 +29,25 @@ use win_etw_provider::EventOptions;
 use win_etw_provider::Provider;
 use win_etw_provider::GUID;
 
+mod config;
+
+pub use config::{FieldAlias, GlobalField, KeywordRule, LevelSet};
+use config::GlobalsBlob;
+
 /// An implementation for [`tracing_subscriber::Layer`] that emits tracelogging
 /// events.
 pub struct TracelogSubscriber {
     provider: EtwProvider,
+    /// Provider metadata bytes. Registered once with ETW (so xperf, TDH,
+    /// etc. can discover the provider schema) and emitted as the first data
+    /// descriptor on every event.
+    provider_metadata: Vec<u8>,
     keyword_mask: u64,
-    global_fields: EventData,
-    trace_keyword: u64,
+    keyword_rules: Vec<KeywordRule>,
+    global_fields: GlobalsBlob,
+    /// Held as `Arc<[FieldAlias]>` so the per-event hot path
+    /// avoids allocating; `set_field_alias` rebuilds the Arc (cold path).
+    field_aliases: Arc<[FieldAlias]>,
 }
 
 impl TracelogSubscriber {
@@ -53,12 +66,11 @@ impl TracelogSubscriber {
         provider.register_provider_metadata(provider_metadata.as_slice())?;
         Ok(Self {
             provider,
+            provider_metadata,
             keyword_mask: !0_u64,
-            global_fields: EventData {
-                metadata: Vec::new(),
-                data: Vec::new(),
-            },
-            trace_keyword: 0,
+            keyword_rules: Vec::new(),
+            global_fields: GlobalsBlob::default(),
+            field_aliases: Arc::from(Vec::<FieldAlias>::new()),
         })
     }
 
@@ -73,8 +85,10 @@ impl TracelogSubscriber {
         };
     }
 
-    pub fn filter_keyword(&self, keyword: u64) -> u64 {
-        keyword & self.keyword_mask
+    /// Adds a [`KeywordRule`]. Multiple rules accumulate (their keywords are
+    /// OR'd together for any event whose level is in the rule's level set).
+    pub fn add_keyword(&mut self, rule: KeywordRule) {
+        self.keyword_rules.push(rule);
     }
 
     /// Global fields are automatically included in all events emitted by this
@@ -86,7 +100,7 @@ impl TracelogSubscriber {
     ///
     /// # Example
     /// ```
-    /// # use win_etw_tracing::TracelogSubscriber;
+    /// # use win_etw_tracing::{TracelogSubscriber, GlobalField};
     /// # use win_etw_provider::GUID;
     /// # let provider_guid = GUID {
     /// #     data1: 0xe1c71d95,
@@ -95,29 +109,33 @@ impl TracelogSubscriber {
     /// #     data4: [0xa9, 0x2b, 0x8a, 0xaa, 0x0b, 0x52, 0x91, 0x58],
     /// # };
     /// let mut layer = TracelogSubscriber::new(provider_guid, "provider_name").unwrap();
-    /// let globals = vec![("field name", "my value")];
+    /// let globals = vec![GlobalField::new("field name", "my value")];
     /// layer.set_global_fields(&globals);
     /// ```
-    pub fn set_global_fields(&mut self, fields: &[(&str, &str)]) {
-        self.global_fields.metadata.clear();
-        self.global_fields.data.clear();
-        for &(name, value) in fields.iter() {
-            self.global_fields.record_global(name, value);
-        }
+    pub fn set_global_fields(&mut self, fields: &[GlobalField]) {
+        self.global_fields = GlobalsBlob::from_fields(fields);
     }
 
-    /// Sets the keyword to use for events logged at [`tracing::Level::TRACE`]
-    /// level.
-    ///
-    /// Because ETW only provides one level below [`win_etw_metadata::Level::INFO`],
-    /// both [`tracing::Level::DEBUG`] and [`tracing::Level::TRACE`] events are
-    /// mapped to [`win_etw_metadata::Level::VERBOSE`]. This method allows
-    /// distinguishing between the two levels by assigning a specific keyword
-    /// used only for [`tracing::Level::TRACE`] events.
-    ///
-    /// By default, this is set to `0`, meaning no keyword is applied.
-    pub fn set_trace_keyword(&mut self, keyword: u64) {
-        self.trace_keyword = keyword;
+    /// Adds (or replaces) a field rename. See [`FieldAlias`].
+    pub fn set_field_alias(&mut self, alias: FieldAlias) {
+        let mut aliases: Vec<FieldAlias> = self.field_aliases.iter().cloned().collect();
+        if let Some(slot) = aliases.iter_mut().find(|a| a.from == alias.from) {
+            slot.to = alias.to;
+        } else {
+            aliases.push(alias);
+        }
+        self.field_aliases = Arc::from(aliases);
+    }
+
+    fn resolve_keyword(&self, level: tracing::Level) -> u64 {
+        let bit = LevelSet::from_level(level);
+        let mut k = 0u64;
+        for r in &self.keyword_rules {
+            if r.levels.contains(bit) {
+                k |= r.keyword;
+            }
+        }
+        k & self.keyword_mask
     }
 }
 
@@ -129,18 +147,13 @@ impl TracelogSubscriber {
         write_target: bool,
         meta: &Metadata<'_>,
         write_name: impl FnOnce(&mut Vec<u8>),
-        record: impl FnOnce(&mut dyn Visit),
+        record: impl FnOnce(&mut EventData<'_>),
     ) {
-        let mut keyword = 0;
         let level = match *meta.level() {
             tracing::Level::ERROR => win_etw_metadata::Level::ERROR,
             tracing::Level::WARN => win_etw_metadata::Level::WARN,
             tracing::Level::INFO => win_etw_metadata::Level::INFO,
-            tracing::Level::DEBUG => win_etw_metadata::Level::VERBOSE,
-            tracing::Level::TRACE => {
-                keyword = self.trace_keyword;
-                win_etw_metadata::Level::VERBOSE
-            }
+            tracing::Level::DEBUG | tracing::Level::TRACE => win_etw_metadata::Level::VERBOSE,
         };
 
         let event_descriptor = EventDescriptor {
@@ -150,25 +163,23 @@ impl TracelogSubscriber {
             level,
             opcode,
             task: 0,
-            keyword: self.filter_keyword(keyword),
+            keyword: self.resolve_keyword(*meta.level()),
         };
 
         if !self.provider.is_event_enabled(&event_descriptor) {
             return;
         }
 
-        let mut event_data = EventData {
-            metadata: Vec::new(),
-            data: Vec::new(),
-        };
+        let mut event_data = EventData::new(&self.field_aliases);
         event_data.metadata.put_u16_le(0); // reserve space for the size
         event_data.metadata.put_u8(0); // no extensions
         write_name(&mut event_data.metadata);
         event_data.metadata.put_u8(0); // null terminator
 
         let target_len = if write_target {
-            // Target field
-            event_data.metadata.put_slice(b"target\0");
+            let target_name = event_data.resolve("target");
+            event_data.metadata.put_slice(target_name.as_bytes());
+            event_data.metadata.put_u8(0); // null terminator
             event_data
                 .metadata
                 .put_u8((InFlag::COUNTED_ANSI_STRING | InFlag::CHAIN_FLAG).bits());
@@ -190,11 +201,12 @@ impl TracelogSubscriber {
         let event_metadata_len = event_data.metadata.len() as u16;
         (&mut event_data.metadata[0..2]).put_u16_le(event_metadata_len);
 
-        // N.B. Since we pre-registered the provider information when creating
-        // the provider, there is no need to log it again here.
+        // TraceLogging events require both the provider-metadata and
+        // per-event-metadata data descriptors at the head of the payload
         let (data_descriptors_with_target, data_descriptors_without_target);
         let data_descriptors = if write_target {
             data_descriptors_with_target = [
+                EventDataDescriptor::for_provider_metadata(self.provider_metadata.as_slice()),
                 EventDataDescriptor::for_event_metadata(event_data.metadata.as_slice()),
                 EventDataDescriptor::from(&target_len),
                 EventDataDescriptor::from(meta.target()),
@@ -203,6 +215,7 @@ impl TracelogSubscriber {
             &data_descriptors_with_target[..]
         } else {
             data_descriptors_without_target = [
+                EventDataDescriptor::for_provider_metadata(self.provider_metadata.as_slice()),
                 EventDataDescriptor::for_event_metadata(event_data.metadata.as_slice()),
                 EventDataDescriptor::for_bytes(&event_data.data),
             ];
@@ -288,6 +301,7 @@ where
             .extensions_mut()
             .insert(activity_id.clone());
 
+        let name = attrs.metadata().name();
         self.write_event(
             WINEVENT_OPCODE_START,
             &EventOptions {
@@ -297,8 +311,8 @@ where
             },
             true,
             attrs.metadata(),
-            |metadata| metadata.extend(attrs.metadata().name().as_bytes()),
-            |visit| attrs.record(visit),
+            |metadata| metadata.extend_from_slice(name.as_bytes()),
+            |event_data| attrs.record(event_data as &mut dyn Visit),
         );
     }
 
@@ -330,6 +344,8 @@ where
             .event_span(event)
             .and_then(|span| span.extensions().get::<ActivityId>().cloned().map(|x| x.0));
 
+        let event_name = meta.name();
+
         self.write_event(
             WINEVENT_OPCODE_INFO,
             &EventOptions {
@@ -338,12 +354,10 @@ where
             },
             true,
             meta,
-            // Write the message as the event name. This will not be ideal for
-            // events with dynamic names, but it should work well for structured
-            // events, and it follows the precedent set by the tracing-opentelemetry
-            // crate.
-            |metadata| event.record(&mut EventName(metadata)),
-            |visit| event.record(visit),
+            |metadata| metadata.extend_from_slice(event_name.as_bytes()),
+            |event_data| {
+                event.record(event_data as &mut dyn Visit);
+            },
         );
     }
 
@@ -352,6 +366,7 @@ where
         let extensions = span.extensions();
         let ActivityId(activity_id) = extensions.get::<ActivityId>().cloned().unwrap();
         let values = extensions.get::<DeferredValues>();
+        let name = span.metadata().name();
         self.write_event(
             WINEVENT_OPCODE_STOP,
             &EventOptions {
@@ -360,10 +375,10 @@ where
             },
             false,
             span.metadata(),
-            |metadata| metadata.extend(span.metadata().name().as_bytes()),
-            |visit| {
+            |metadata| metadata.extend_from_slice(name.as_bytes()),
+            |event_data| {
                 if let Some(values) = values {
-                    values.record(visit)
+                    values.record(event_data as &mut dyn Visit)
                 };
             },
         );
@@ -428,45 +443,56 @@ enum DeferredValue {
     String(String),
 }
 
-struct EventName<'a>(&'a mut Vec<u8>);
-
-impl Visit for EventName<'_> {
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        if field.name() == "message" {
-            let _ = write!(self.0, "{value:?}");
-        }
-    }
-}
-
-struct EventData {
+/// Per-event payload builder. Borrows the alias slice from the subscriber so
+/// no per-event cloning is required.
+struct EventData<'a> {
     metadata: Vec<u8>,
     data: Vec<u8>,
+    aliases: &'a [FieldAlias],
 }
 
-impl EventData {
+impl<'a> EventData<'a> {
+    fn new(aliases: &'a [FieldAlias]) -> Self {
+        Self {
+            metadata: Vec::new(),
+            data: Vec::new(),
+            aliases,
+        }
+    }
+
+    /// Resolves a field name through the alias table. Returns the renamed
+    /// name if `name` is aliased, or `name` unchanged otherwise.
+    fn resolve(&self, name: &'a str) -> &'a str {
+        for a in self.aliases {
+            if a.from == name {
+                return a.to.as_str();
+            }
+        }
+        name
+    }
+
+    /// Writes the resolved field name + null terminator. Returns `false` if
+    /// the field should be skipped (only used for the `tracing-log`
+    /// passthrough fields).
     fn write_name(&mut self, name: &str) -> bool {
-        // Skip the message (used as the event name) as well as any log crate
-        // metadata (already consumed).
-        if name == "message" || (cfg!(feature = "tracing-log") && name.starts_with("log.")) {
+        if cfg!(feature = "tracing-log") && name.starts_with("log.") {
             return false;
         }
-        self.metadata.put_slice(name.as_bytes());
-        self.metadata.put_u8(0); // null terminator
+        // Split-borrow: resolve via `&self.aliases`, write via `&mut self.metadata`.
+        let aliases = self.aliases;
+        let metadata = &mut self.metadata;
+        let resolved: &str = aliases
+            .iter()
+            .find(|a| a.from == name)
+            .map(|a| a.to.as_str())
+            .unwrap_or(name);
+        metadata.put_slice(resolved.as_bytes());
+        metadata.put_u8(0);
         true
-    }
-
-    fn record_global(&mut self, name: &str, value: &str) {
-        if self.write_name(name) {
-            self.metadata
-                .put_u8((InFlag::ANSI_STRING | InFlag::CHAIN_FLAG).bits());
-            self.metadata.put_u8(OutFlag::UTF8.bits());
-            self.data.extend(value.as_bytes());
-            self.data.put_u8(0); // null terminator
-        }
     }
 }
 
-impl Visit for EventData {
+impl<'a> Visit for EventData<'a> {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         if self.write_name(field.name()) {
             self.metadata
@@ -528,11 +554,10 @@ impl Visit for EventData {
 
 #[cfg(test)]
 mod tests {
-    use crate::TracelogSubscriber;
+    use super::*;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::reload;
     use tracing_subscriber::Registry;
-    use win_etw_provider::GUID;
 
     static PROVIDER_GUID: GUID = GUID {
         data1: 0xe1c71d95,
@@ -576,16 +601,44 @@ mod tests {
         );
         let _x = Registry::default().with(layer).set_default();
         tracing::info!(a_field = 123, "test globals");
-        let global = vec![("global", "some value")];
+        let global = vec![GlobalField::new("global", "some value")];
         reload_handle
             .modify(|layer| layer.set_global_fields(&global))
             .unwrap();
         tracing::info!(a_field = 456, "test globals modify");
         let _s = tracing::info_span!("span with globals", span_field = "abc").entered();
-        let global = vec![("global", "new value"), ("global2", "value")];
+        let global = vec![
+            GlobalField::new("global", "new value"),
+            GlobalField::new("global2", "value"),
+        ];
         reload_handle
             .modify(|layer| layer.set_global_fields(&global))
             .unwrap();
         tracing::info!(a_field = 789, "test globals modify again");
+    }
+
+    #[test]
+    fn aliases() {
+        let mut layer = TracelogSubscriber::new(PROVIDER_GUID.clone(), PROVIDER_NAME).unwrap();
+        layer.set_field_alias(FieldAlias::new("target", "TaskName"));
+        layer.set_field_alias(FieldAlias::new("message", "msg"));
+        let _x = Registry::default().with(layer).set_default();
+        tracing::info!(foo = 1, "hello world");
+    }
+
+    #[test]
+    fn keyword_rules() {
+        let mut layer = TracelogSubscriber::new(PROVIDER_GUID.clone(), PROVIDER_NAME).unwrap();
+        layer.add_keyword(KeywordRule {
+            keyword: 0x1,
+            levels: LevelSet::ALL,
+        });
+        layer.add_keyword(KeywordRule {
+            keyword: 0x10,
+            levels: LevelSet::TRACE | LevelSet::DEBUG,
+        });
+        assert_eq!(layer.resolve_keyword(tracing::Level::INFO), 0x1);
+        assert_eq!(layer.resolve_keyword(tracing::Level::TRACE), 0x11);
+        assert_eq!(layer.resolve_keyword(tracing::Level::DEBUG), 0x11);
     }
 }
