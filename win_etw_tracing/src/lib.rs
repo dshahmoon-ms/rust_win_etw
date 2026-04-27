@@ -29,12 +29,7 @@ use win_etw_provider::EventOptions;
 use win_etw_provider::Provider;
 use win_etw_provider::GUID;
 
-// ---------------------------------------------------------------------------
-// Keyword configuration
-// ---------------------------------------------------------------------------
-
-/// Set of `tracing` levels at which a [`KeywordRule`] applies. Combine
-/// variants with `|`.
+/// Set of `tracing` levels at which a [`KeywordRule`] applies. Combine variants with `|`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LevelSet(u8);
 
@@ -95,10 +90,6 @@ pub struct KeywordRule {
     pub levels: LevelSet,
 }
 
-// ---------------------------------------------------------------------------
-// Field aliases and global fields
-// ---------------------------------------------------------------------------
-
 /// Renames an ETW field at write time. Any field that would have been emitted
 /// under `from` is emitted under `to` instead. The value is unchanged.
 ///
@@ -120,8 +111,7 @@ impl FieldAlias {
     }
 }
 
-/// A constant key/value field included in every event emitted by the
-/// subscriber.
+/// A constant key/value field included in every event emitted by the subscriber.
 #[derive(Debug, Clone)]
 pub struct GlobalField {
     pub name: String,
@@ -161,10 +151,6 @@ impl GlobalsBlob {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Subscriber
-// ---------------------------------------------------------------------------
-
 /// An implementation for [`tracing_subscriber::Layer`] that emits tracelogging
 /// events.
 pub struct TracelogSubscriber {
@@ -174,12 +160,9 @@ pub struct TracelogSubscriber {
     /// descriptor on every event.
     provider_metadata: Vec<u8>,
     keyword_mask: u64,
-    /// Per-level keyword contributions. OR'd together for every event whose
-    /// level is in the rule's level set.
     keyword_rules: Vec<KeywordRule>,
-    /// Pre-rendered metadata + data blob for the constant global fields.
     global_fields: GlobalsBlob,
-    /// Field renames. Held as `Arc<[FieldAlias]>` so the per-event hot path
+    /// Held as `Arc<[FieldAlias]>` so the per-event hot path
     /// avoids allocating; `set_field_alias` rebuilds the Arc (cold path).
     field_aliases: Arc<[FieldAlias]>,
 }
@@ -208,7 +191,7 @@ impl TracelogSubscriber {
         })
     }
 
-    /// If some events are by default marked with telemetry keywords, this allows an opt out.
+    // If some events are by default marked with telemetry keywords, this allows an opt out.
     pub fn enable_telemetry_events(&mut self, enabled: bool) {
         self.keyword_mask = if enabled {
             !0_u64
@@ -311,8 +294,6 @@ impl TracelogSubscriber {
         event_data.metadata.put_u8(0); // null terminator
 
         let target_len = if write_target {
-            // Auto-emitted `target` field, with alias applied so consumers
-            // can rename it (e.g. to `TaskName`).
             let target_name = event_data.resolve("target");
             event_data.metadata.put_slice(target_name.as_bytes());
             event_data.metadata.put_u8(0); // null terminator
@@ -338,9 +319,7 @@ impl TracelogSubscriber {
         (&mut event_data.metadata[0..2]).put_u16_le(event_metadata_len);
 
         // TraceLogging events require both the provider-metadata and
-        // per-event-metadata data descriptors at the head of the payload so
-        // that TDH can decode them. The codegen in `win_etw_macros` does the
-        // same.
+        // per-event-metadata data descriptors at the head of the payload
         let (data_descriptors_with_target, data_descriptors_without_target);
         let data_descriptors = if write_target {
             data_descriptors_with_target = [
@@ -580,10 +559,6 @@ enum DeferredValue {
     Boolean(bool),
     String(String),
 }
-
-// ---------------------------------------------------------------------------
-// Per-event payload builder
-// ---------------------------------------------------------------------------
 
 /// Per-event payload builder. Borrows the alias slice from the subscriber so
 /// no per-event cloning is required.
